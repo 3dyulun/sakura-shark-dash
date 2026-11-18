@@ -1,5 +1,9 @@
 # Sakura Shark Dash 🌸🦈
 
+[![Make the best game](https://make.fun/badge/best-game-01.svg)](https://make.fun/bounty/best-game-01)
+[![Rank](https://make.fun/badge/best-game-01/3dyulun/sakura-shark-dash/rank.svg)](https://make.fun/bounty/best-game-01)
+[![Reward](https://make.fun/badge/best-game-01/3dyulun/sakura-shark-dash/reward.svg)](https://make.fun/bounty/best-game-01)
+
 A 75-second arcade catcher for make.fun **"Make the best game"** ($1,000, closes 2026-11-19 02:00 HKT).
 
 You are a shark in a blue sakura kimono with a gold belt, swimming under a
