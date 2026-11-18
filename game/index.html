@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Sakura Shark Dash</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body { height:100%; background:#0d1026; overflow:hidden;
+    font-family:"Avenir Next","Segoe UI",system-ui,sans-serif; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; max-width:100vw; max-height:100vh; width:auto; height:auto;
+    border-radius:12px; box-shadow:0 0 60px rgba(255,120,180,.25), 0 0 0 1px rgba(255,255,255,.08);
+    touch-action:none; cursor:pointer; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="960" height="540"></canvas></div>
+<script>
+"use strict";
+/* Sakura Shark Dash — a 75-second arcade catcher.
+   Move the shark, catch petals & sushi, dodge ink bombs.
+   No external assets: everything is drawn + sounded in code, fully offline. */
+const cv = document.getElementById("game");
+const ctx = cv.getContext("2d");
+const W = 960, H = 540, FLOOR = H - 64;
+const ROUND_LEN = 75;
+
+const state = {
+  mode: "title", // title | playing | over
+  score: 0, best: 0, lives: 3, combo: 0, bestCombo: 0,
+  timeLeft: ROUND_LEN, level: 1, elapsed: 0,
+  shake: 0, flash: 0, muted: false, frame: 0,
+};
+const player = { x: W / 2, y: FLOOR, w: 150, h: 74, vx: 0, dir: 1, tilt: 0 };
+let items = [], parts = [], pops = [], bgPetals = [], bells = [];
+let spawnT = 0, catT = 6;
+
+// ---------- audio (WebAudio, no files) ----------
+let AC = null;
+function audio() {
+  if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { AC = null; } }
+  if (AC && AC.state === "suspended") AC.resume();
+  return AC;
+}
+function beep(f0, f1, dur, type, vol) {
+  if (state.muted) return;
+  const ac = audio(); if (!ac) return;
+  const o = ac.createOscillator(), g = ac.createGain();
+  o.type = type || "sine";
+  o.frequency.setValueAtTime(f0, ac.currentTime);
+  o.frequency.exponentialRampToValueAtTime(Math.max(1, f1), ac.currentTime + dur);
+  g.gain.setValueAtTime(vol || 0.12, ac.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + dur);
+  o.connect(g).connect(ac.destination); o.start(); o.stop(ac.currentTime + dur);
+}
+const sfx = {
+  catch: (c) => beep(520 + c * 40, 880 + c * 40, 0.12, "sine", 0.12),
+  sushi: () => { beep(660, 990, 0.14, "triangle", 0.14); setTimeout(() => beep(990, 1320, 0.12, "triangle", 0.1), 70); },
+  bell: () => { beep(1046, 1046, 0.25, "sine", 0.12); setTimeout(() => beep(1568, 1568, 0.3, "sine", 0.1), 90); },
+  bomb: () => beep(220, 55, 0.35, "sawtooth", 0.16),
+  level: () => { beep(523, 523, 0.1, "triangle", 0.12); setTimeout(() => beep(784, 784, 0.16, "triangle", 0.12), 100); },
+  over: () => { beep(392, 392, 0.18, "triangle", 0.12); setTimeout(() => beep(311, 196, 0.4, "triangle", 0.12), 180); },
+};
+
+// ---------- helpers ----------
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+function rr(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+function burst(x, y, color, n, speed) {
+  for (let i = 0; i < n; i++) {
+    const a = rand(0, Math.PI * 2), s = rand(speed * 0.3, speed);
+    parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 1, life: rand(0.4, 0.9), max: 0.9, color, r: rand(2, 5) });
+  }
+}
+function pop(x, y, text, color) { pops.push({ x, y, text, color, life: 1 }); }
+
+// ---------- background petals ----------
+for (let i = 0; i < 26; i++) bgPetals.push({ x: rand(0, W), y: rand(0, H), s: rand(4, 10), v: rand(0.3, 1.1), ph: rand(0, 6.28), rot: rand(0, 6.28) });
+
+// ---------- spawning ----------
+function spawnItem() {
+  const r = Math.random();
+  let kind = "petal", vy = rand(1.6, 2.4) + state.level * 0.22;
+  if (r < 0.62) kind = "petal";
+  else if (r < 0.82) { kind = "sushi"; vy *= 1.15; }
+  else if (r < 0.92) { kind = "koi"; vy *= 1.3; }
+  else { kind = "bomb"; vy *= 1.25; }
+  items.push({ kind, x: rand(40, W - 40), y: -30, vy, sway: rand(0.4, 1.4), ph: rand(0, 6.28), rot: rand(0, 6.28), vr: rand(-0.03, 0.03) });
+}
+function spawnBell() { bells.push({ x: rand(80, W - 80), y: -30, vy: 1.7, ph: rand(0, 6.28) }); }
+
+// ---------- drawing ----------
+function drawPetal(x, y, s, rot, color) {
+  ctx.save(); ctx.translate(x, y); ctx.rotate(rot);
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(0, -s); ctx.bezierCurveTo(s, -s * 0.6, s, s * 0.6, 0, s);
+  ctx.bezierCurveTo(-s, s * 0.6, -s, -s * 0.6, 0, -s);
+  ctx.fill(); ctx.restore();
+}
+function drawShark(x, y, dir, tilt) {
+  ctx.save(); ctx.translate(x, y); ctx.rotate(tilt); ctx.scale(dir, 1);
+  // tail
+  ctx.fillStyle = "#5aa9e6";
+  ctx.beginPath(); ctx.moveTo(-58, 0); ctx.lineTo(-84, -22); ctx.lineTo(-76, 0); ctx.lineTo(-84, 22); ctx.closePath(); ctx.fill();
+  // body
+  ctx.fillStyle = "#5aa9e6";
+  ctx.beginPath(); ctx.ellipse(0, 0, 62, 34, 0, 0, Math.PI * 2); ctx.fill();
+  // belly
+  ctx.fillStyle = "#eaf6ff";
+  ctx.beginPath(); ctx.ellipse(6, 12, 46, 18, 0, 0, Math.PI * 2); ctx.fill();
+  // sakura kimono band + gold belt
+  ctx.save(); ctx.beginPath(); ctx.ellipse(0, 0, 62, 34, 0, 0, Math.PI * 2); ctx.clip();
+  ctx.fillStyle = "#7fb8f0"; ctx.fillRect(-62, -14, 124, 22);
+  ctx.fillStyle = "#ffd76a"; ctx.fillRect(-62, 4, 124, 7);
+  ctx.fillStyle = "#ff9ec7";
+  for (const [fx, fy] of [[-38, -6], [-8, -2], [22, -8], [44, -2]]) { drawPetal(fx, fy, 5, 0.6, "#ff9ec7"); }
+  ctx.restore();
+  // dorsal fin
+  ctx.fillStyle = "#3d8fd1";
+  ctx.beginPath(); ctx.moveTo(-12, -30); ctx.quadraticCurveTo(2, -52, 16, -30); ctx.closePath(); ctx.fill();
+  // eye + smile (open-mouth smile)
+  ctx.fillStyle = "#10203a"; ctx.beginPath(); ctx.arc(34, -10, 5, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(36, -12, 1.8, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = "#10203a"; ctx.lineWidth = 3; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.arc(48, 8, 10, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+  ctx.fillStyle = "#ff7d9c"; ctx.beginPath(); ctx.arc(48, 14, 4, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+}
+function drawCat(x, y, s) { // tuxedo cat girl mascot, peeking on the title screen
+  ctx.save(); ctx.translate(x, y); ctx.scale(s, s);
+  ctx.fillStyle = "#1c1c22";
+  ctx.beginPath(); ctx.moveTo(-34, -18); ctx.lineTo(-26, -52); ctx.lineTo(-6, -28); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(34, -18); ctx.lineTo(26, -52); ctx.lineTo(6, -28); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = "#ff9ec7";
+  ctx.beginPath(); ctx.moveTo(-29, -24); ctx.lineTo(-25, -42); ctx.lineTo(-12, -29); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(29, -24); ctx.lineTo(25, -42); ctx.lineTo(12, -29); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = "#1c1c22"; ctx.beginPath(); ctx.arc(0, 0, 36, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = "#fff";
+  ctx.beginPath(); ctx.moveTo(0, -34); ctx.lineTo(9, -10); ctx.lineTo(14, 12); ctx.lineTo(-14, 12); ctx.lineTo(-9, -10); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(0, 20, 15, 9, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = "#f5b942";
+  ctx.beginPath(); ctx.arc(-14, -4, 5, 0, Math.PI * 2); ctx.arc(14, -4, 5, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = "#1c1c22";
+  ctx.beginPath(); ctx.arc(-14, -4, 2.2, 0, Math.PI * 2); ctx.arc(14, -4, 2.2, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = "#ff8fb0"; ctx.beginPath(); ctx.moveTo(-4, 8); ctx.lineTo(4, 8); ctx.lineTo(0, 13); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = "#1c1c22"; ctx.lineWidth = 2; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.arc(0, 13, 7, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+  ctx.restore();
+}
+function drawItem(it) {
+  ctx.save(); ctx.translate(it.x, it.y);
+  if (it.kind === "petal") { drawPetal(0, 0, 13, it.rot, "#ffb7d5"); drawPetal(0, 0, 7, it.rot + 1, "#ff8fb0"); }
+  else if (it.kind === "sushi") {
+    ctx.rotate(Math.sin(it.ph) * 0.2);
+    ctx.fillStyle = "#fff"; rr(-18, -10, 36, 20, 8); ctx.fill();
+    ctx.fillStyle = "#ff8a5c"; rr(-18, -6, 36, 8, 4); ctx.fill();
+    ctx.fillStyle = "#2e3d33"; ctx.fillRect(-18, -10, 6, 20);
+    ctx.fillStyle = "#ffd76a"; ctx.beginPath(); ctx.arc(8, 0, 3, 0, Math.PI * 2); ctx.fill();
+  } else if (it.kind === "koi") {
+    ctx.fillStyle = "#ffb347";
+    ctx.beginPath(); ctx.ellipse(0, 0, 20, 10, it.rot * 0.3, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(-18, 0); ctx.lineTo(-30, -8); ctx.lineTo(-30, 8); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(8, -3, 3, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#ff7d5c"; ctx.beginPath(); ctx.arc(-4, -4, 5, 0, Math.PI * 2); ctx.fill();
+  } else { // bomb: ink blob
+    ctx.fillStyle = "#232742";
+    ctx.beginPath(); ctx.arc(0, 0, 16, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(-10, 10, 7, 0, Math.PI * 2); ctx.arc(11, 9, 6, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#ff5d73"; ctx.beginPath(); ctx.arc(-5, -4, 3, 0, Math.PI * 2); ctx.arc(6, -4, 3, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = "#ff5d73"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(-6, 6); ctx.lineTo(6, 6); ctx.stroke();
+  }
+  ctx.restore();
+}
+function drawBell(b) {
+  ctx.save(); ctx.translate(b.x, b.y);
+  ctx.fillStyle = "#ffd76a"; ctx.beginPath(); ctx.arc(0, 0, 14, Math.PI, 0); ctx.closePath(); ctx.fill();
+  ctx.fillRect(-14, -2, 28, 5);
+  ctx.fillStyle = "#fff2b0"; ctx.beginPath(); ctx.arc(0, 8, 4, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+}
+function drawHUD() {
+  ctx.fillStyle = "rgba(10,14,38,.55)"; rr(12, 10, 300, 58, 12); ctx.fill();
+  ctx.fillStyle = "#fff"; ctx.font = "bold 24px 'Avenir Next',sans-serif"; ctx.textAlign = "left"; ctx.textBaseline = "middle";
+  ctx.fillText("SCORE " + state.score, 26, 30);
+  ctx.fillStyle = "#ffd76a"; ctx.font = "bold 15px 'Avenir Next',sans-serif";
+  ctx.fillText("BEST " + state.best + (state.combo >= 2 ? "   COMBO x" + state.combo : ""), 26, 54);
+  ctx.textAlign = "right";
+  ctx.fillStyle = state.timeLeft <= 10 ? "#ff5d73" : "#fff";
+  ctx.font = "bold 24px 'Avenir Next',sans-serif";
+  ctx.fillText("⏱ " + Math.ceil(state.timeLeft) + "s", W - 26, 34);
+  ctx.fillStyle = "#ffb7d5"; ctx.font = "bold 15px 'Avenir Next',sans-serif";
+  ctx.fillText("LEVEL " + state.level, W - 26, 54);
+  // lives as hearts
+  ctx.textAlign = "left";
+  for (let i = 0; i < 3; i++) {
+    ctx.fillStyle = i < state.lives ? "#ff5d73" : "rgba(255,255,255,.18)";
+    const hx = 330 + i * 30, hy = 33;
+    ctx.beginPath(); ctx.moveTo(hx, hy + 8);
+    ctx.bezierCurveTo(hx - 11, hy - 2, hx - 6, hy - 11, hx, hy - 4);
+    ctx.bezierCurveTo(hx + 6, hy - 11, hx + 11, hy - 2, hx, hy + 8); ctx.fill();
+  }
+  ctx.textAlign = "center";
+}
+function drawBackground() {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, "#1b2350"); g.addColorStop(0.55, "#3b2a63"); g.addColorStop(1, "#0d1026");
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = "rgba(255,255,255,.75)";
+  for (let i = 0; i < 40; i++) { const sx = (i * 173) % W, sy = (i * 97) % 220; ctx.fillRect(sx, sy, 2, 2); }
+  ctx.fillStyle = "rgba(255,183,213,.5)";
+  ctx.beginPath(); ctx.arc(830, 90, 46, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = "rgba(255,240,248,.85)";
+  ctx.beginPath(); ctx.arc(830, 90, 38, 0, Math.PI * 2); ctx.fill();
+  for (const p of bgPetals) drawPetal(p.x, p.y, p.s, p.rot, "rgba(255,183,213,.55)");
+  // sea floor
+  ctx.fillStyle = "#141a3d"; ctx.fillRect(0, FLOOR + 34, W, H - FLOOR - 34);
+  ctx.fillStyle = "#1e2760"; ctx.fillRect(0, FLOOR + 34, W, 4);
+  ctx.fillStyle = "rgba(255,183,213,.35)";
+  for (let i = 0; i < 8; i++) drawPetal(60 + i * 120, FLOOR + 52, 6, i, "rgba(255,183,213,.3)");
+}
+function drawTitle() {
+  ctx.fillStyle = "rgba(10,14,38,.45)"; ctx.fillRect(0, 0, W, H);
+  drawCat(150, 150, 1.15);
+  drawShark(800, 430, -1, 0.08);
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = "#ffb7d5"; ctx.font = "bold 30px 'Avenir Next',sans-serif";
+  ctx.fillText("🌸 SAKURA SEASON 🌸", W / 2, 108);
+  ctx.fillStyle = "#fff"; ctx.font = "bold 64px 'Avenir Next',sans-serif";
+  ctx.fillText("SAKURA SHARK", W / 2, 168);
+  ctx.fillStyle = "#ffd76a"; ctx.font = "bold 64px 'Avenir Next',sans-serif";
+  ctx.fillText("DASH", W / 2, 232);
+  ctx.fillStyle = "#dfe6ff"; ctx.font = "20px 'Avenir Next',sans-serif";
+  ctx.fillText("Catch petals, sushi & golden koi. Dodge the ink bombs.", W / 2, 292);
+  ctx.fillText("Chain catches for combos — grab the lucky bell for +100 & a life.", W / 2, 322);
+  ctx.fillStyle = "#fff"; ctx.font = "bold 22px 'Avenir Next',sans-serif";
+  ctx.fillText("← → / A D / mouse / touch to swim  •  75 seconds  •  3 lives", W / 2, 372);
+  const pulse = 0.75 + Math.sin(state.frame * 0.06) * 0.25;
+  ctx.fillStyle = "rgba(255,215,106," + pulse + ")";
+  ctx.font = "bold 26px 'Avenir Next',sans-serif";
+  ctx.fillText("CLICK OR PRESS SPACE TO START", W / 2, 428);
+  ctx.fillStyle = "rgba(255,255,255,.55)"; ctx.font = "15px 'Avenir Next',sans-serif";
+  ctx.fillText("M = mute  •  P = pause  •  best score saved for this session", W / 2, 470);
+}
+function drawOver() {
+  ctx.fillStyle = "rgba(10,14,38,.6)"; ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = "#ffb7d5"; ctx.font = "bold 28px 'Avenir Next',sans-serif";
+  ctx.fillText("TIME'S UP!", W / 2, 130);
+  ctx.fillStyle = "#fff"; ctx.font = "bold 56px 'Avenir Next',sans-serif";
+  ctx.fillText("SCORE  " + state.score, W / 2, 200);
+  ctx.fillStyle = "#ffd76a"; ctx.font = "bold 24px 'Avenir Next',sans-serif";
+  ctx.fillText("BEST  " + state.best + "    •    BEST COMBO  x" + state.bestCombo + "    •    LEVEL " + state.level, W / 2, 258);
+  ctx.fillStyle = "#dfe6ff"; ctx.font = "20px 'Avenir Next',sans-serif";
+  ctx.fillText(state.score >= 600 ? "Legendary shark! The sakura bows to you. 🦈🌸"
+    : state.score >= 300 ? "Great swim — one more run and you'll beat it!"
+    : "Warm-up done. The petals are waiting.", W / 2, 308);
+  const pulse = 0.75 + Math.sin(state.frame * 0.06) * 0.25;
+  ctx.fillStyle = "rgba(255,215,106," + pulse + ")";
+  ctx.font = "bold 26px 'Avenir Next',sans-serif";
+  ctx.fillText("CLICK OR PRESS R TO PLAY AGAIN", W / 2, 372);
+}
+function draw() {
+  ctx.save();
+  if (state.shake > 0.5) ctx.translate(rand(-state.shake, state.shake) * 0.5, rand(-state.shake, state.shake) * 0.5);
+  drawBackground();
+  for (const it of items) drawItem(it);
+  for (const b of bells) drawBell(b);
+  if (state.mode !== "title") drawShark(player.x, player.y, player.dir, player.tilt);
+  for (const p of parts) {
+    ctx.globalAlpha = Math.max(0, p.life / p.max);
+    ctx.fillStyle = p.color; ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  for (const p of pops) {
+    ctx.globalAlpha = Math.max(0, p.life);
+    ctx.fillStyle = p.color; ctx.font = "bold 20px 'Avenir Next',sans-serif";
+    ctx.fillText(p.text, p.x, p.y);
+  }
+  ctx.globalAlpha = 1;
+  if (state.mode === "playing") drawHUD();
+  if (state.mode === "paused") {
+    drawHUD();
+    ctx.fillStyle = "rgba(10,14,38,.6)"; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = "#fff"; ctx.font = "bold 40px 'Avenir Next',sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.fillText("PAUSED — press P to resume", W / 2, H / 2);
+  }
+  if (state.mode === "title") drawTitle();
+  if (state.mode === "over") drawOver();
+  if (state.flash > 0) { ctx.fillStyle = "rgba(255,60,90," + (state.flash * 0.9) + ")"; ctx.fillRect(0, 0, W, H); }
+  ctx.restore();
+}
+
+// ---------- input ----------
+const input = { keys: new Set(), pointerActive: false, pointerX: W / 2 };
+function canvasX(e) {
+  const r = cv.getBoundingClientRect();
+  const cx = (e.touches ? e.touches[0].clientX : e.clientX);
+  return (cx - r.left) / r.width * W;
+}
+cv.addEventListener("pointerdown", (e) => {
+  audio();
+  input.pointerActive = true; input.pointerX = canvasX(e);
+  if (state.mode !== "playing") startGame();
+});
+cv.addEventListener("pointermove", (e) => { if (input.pointerActive) input.pointerX = canvasX(e); });
+addEventListener("pointerup", () => { input.pointerActive = false; });
+addEventListener("keydown", (e) => {
+  if (["ArrowLeft", "ArrowRight", " "].includes(e.key)) e.preventDefault();
+  if (e.key === " " && state.mode !== "playing") { startGame(); return; }
+  if ((e.key === "r" || e.key === "R") && state.mode === "over") { startGame(); return; }
+  if (e.key === "m" || e.key === "M") { state.muted = !state.muted; return; }
+  if ((e.key === "p" || e.key === "P") && state.mode === "playing") { state.mode = "paused"; return; }
+  if ((e.key === "p" || e.key === "P") && state.mode === "paused") { state.mode = "playing"; return; }
+  input.keys.add(e.key.length === 1 ? e.key.toLowerCase() : e.key);
+});
+addEventListener("keyup", (e) => input.keys.delete(e.key.length === 1 ? e.key.toLowerCase() : e.key));
+// ---------- game flow ----------
+function startGame() {
+  audio();
+  Object.assign(state, { mode: "playing", score: 0, lives: 3, combo: 0, bestCombo: 0, timeLeft: ROUND_LEN, level: 1, elapsed: 0, shake: 0, flash: 0 });
+  items = []; parts = []; pops = []; bells = []; spawnT = 0; catT = 6;
+  player.x = W / 2; player.vx = 0;
+}
+function gameOver() {
+  state.mode = "over";
+  state.best = Math.max(state.best, state.score);
+  sfx.over();
+  burst(player.x, player.y, "#7cc4ff", 26, 4);
+}
+function levelUpCheck() {
+  const lv = 1 + Math.floor(state.score / 200);
+  if (lv !== state.level) { state.level = lv; sfx.level(); pop(W / 2, 150, "LEVEL " + lv + " — FASTER!", "#ffd76a"); }
+}
+
+// ---------- update ----------
+function update(dt) {
+  state.frame++;
+  for (const p of bgPetals) {
+    p.y += p.v; p.x += Math.sin(state.frame * 0.01 + p.ph) * 0.5; p.rot += 0.01;
+    if (p.y > H + 12) { p.y = -12; p.x = rand(0, W); }
+  }
+  if (state.shake > 0) state.shake *= 0.88;
+  if (state.flash > 0) state.flash -= dt;
+  for (const p of parts) { p.x += p.vx; p.y += p.vy; p.vy += 0.08; p.life -= dt; }
+  parts = parts.filter(p => p.life > 0);
+  for (const p of pops) { p.y -= 0.7; p.life -= dt * 0.9; }
+  pops = pops.filter(p => p.life > 0);
+  if (state.mode !== "playing") return;
+
+  state.elapsed += dt;
+  state.timeLeft = Math.max(0, ROUND_LEN - state.elapsed);
+  if (state.timeLeft <= 0) { gameOver(); return; }
+
+  // player movement: keyboard velocity + pointer follow
+  const keys = input.keys;
+  let target = null;
+  if (keys.has("ArrowLeft") || keys.has("a")) target = player.x - 9;
+  if (keys.has("ArrowRight") || keys.has("d")) target = player.x + 9;
+  if (input.pointerActive) target = input.pointerX;
+  if (target !== null) {
+    const nx = clamp(target, 70, W - 70);
+    player.vx = nx - player.x; player.x = nx;
+    if (Math.abs(player.vx) > 0.5) player.dir = player.vx > 0 ? 1 : -1;
+    player.tilt = clamp(player.vx * 0.02, -0.18, 0.18);
+  } else { player.vx *= 0.8; player.tilt *= 0.9; }
+
+  spawnT -= dt;
+  if (spawnT <= 0) { spawnItem(); spawnT = Math.max(0.28, 0.72 - state.level * 0.06); }
+  catT -= dt;
+  if (catT <= 0) { spawnBell(); catT = rand(9, 14); }
+
+  const px0 = player.x - player.w / 2 + 12, px1 = player.x + player.w / 2 - 12;
+  const py0 = player.y - player.h / 2, py1 = player.y + player.h / 2 - 6;
+  function caught(it, r) {
+    return it.x > px0 - r && it.x < px1 + r && it.y > py0 - 6 && it.y < py1 + 6;
+  }
+  for (const it of items) {
+    it.y += it.vy; it.x += Math.sin(state.frame * 0.03 + it.ph) * it.sway; it.rot += it.vr;
+    if (caught(it, 26)) {
+      it.dead = true;
+      if (it.kind === "bomb") {
+        state.lives--; state.combo = 0; state.shake = 14; state.flash = 0.25; sfx.bomb();
+        burst(it.x, it.y, "#3a3f5e", 22, 4);
+        pop(it.x, it.y - 20, "INK! -1 LIFE", "#9aa3c7");
+        if (state.lives <= 0) { gameOver(); return; }
+      } else {
+        state.combo++; state.bestCombo = Math.max(state.bestCombo, state.combo);
+        const mult = 1 + Math.floor(state.combo / 5);
+        const val = (it.kind === "petal" ? 10 : it.kind === "sushi" ? 25 : 50) * mult;
+        state.score += val;
+        if (it.kind === "sushi") sfx.sushi(); else sfx.catch(state.combo);
+        burst(it.x, it.y, it.kind === "koi" ? "#ffd76a" : it.kind === "sushi" ? "#ff8fb0" : "#ffb7d5", 10, 3);
+        pop(it.x, it.y - 18, "+" + val + (mult > 1 ? " x" + mult : ""), "#ffffff");
+        levelUpCheck();
+      }
+    } else if (it.y > H + 30) {
+      it.dead = true;
+      if (it.kind !== "bomb") state.combo = 0; // dropped a good one: combo resets
+    }
+  }
+  items = items.filter(i => !i.dead);
+  for (const b of bells) {
+    b.y += b.vy; b.x += Math.sin(state.frame * 0.02 + b.ph) * 1.2;
+    if (caught(b, 24)) {
+      b.dead = true; state.score += 100; if (state.lives < 3) state.lives++;
+      sfx.bell(); burst(b.x, b.y, "#ffd76a", 20, 4);
+      pop(b.x, b.y - 20, "+100 LUCKY BELL!", "#ffd76a");
+    } else if (b.y > H + 30) b.dead = true;
+  }
+  bells = bells.filter(b => !b.dead);
+}
+
+// ---------- loop ----------
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now;
+  if (state.mode !== "paused") update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
